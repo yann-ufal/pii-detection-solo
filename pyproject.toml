@@ -1,0 +1,13 @@
+[project]
+name = "pii-detection-solo"
+version = "0.1.0"
+description = "pii privacy-filter model for LUMI deployment"
+readme = "README.md"
+requires-python = ">=3.12"
+# On LUMI these come from the container + the upgraded venv
+dependencies = [
+    "transformers>=5.6.0",
+    "torch",
+    "numpy",
+    "zstandard>=0.25.0",
+]
