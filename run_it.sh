@@ -11,7 +11,7 @@
 # No flaky cross-node rendezvous barrier
 
 
-#SBATCH --job-name=pii-infer-test             # <-- EDIT to be unique
+#SBATCH --job-name=pii-samples             # <-- EDIT to be unique
 #SBATCH --account=project_465002530      # <-- EDIT
 #SBATCH --partition=standard-g           # full LUMI-G nodes (required for multi-node)
 #SBATCH --nodes=1                       # <-- EDIT to fit data volume
@@ -19,7 +19,7 @@
 #SBATCH --gpus-per-node=8                
 #SBATCH --cpus-per-task=56               
 #SBATCH --mem=480G                       # near the 512G per-node maximum
-#SBATCH --time=6:00:00                  # <-- EDIT to fit data volume
+#SBATCH --time=12:00:00                  # <-- EDIT to fit data volume
 #SBATCH --output=logs/pii-%j.out
 #SBATCH --error=logs/pii-%j.err
 
@@ -42,10 +42,8 @@ export SINGULARITYENV_HF_HOME=/user-software/hf
 export SINGULARITYENV_HF_HUB_OFFLINE=1
 export SINGULARITYENV_TRANSFORMERS_OFFLINE=1
 
-# TEST ONLY: log every torch.compile recompilation so the 8-file validation run
-# can confirm flex_attention compiles once per bucket and never recompiles
-# mid-run. Remove for production runs -- it adds nothing once verified.
-export SINGULARITYENV_TORCH_LOGS=recompiles
+# Logs every torch.compile recompilation
+# export SINGULARITYENV_TORCH_LOGS=recompiles
 
 # Per-job MIOpen scratch dirs
 MIOPEN_DIR=$(mktemp -d)

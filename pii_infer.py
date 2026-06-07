@@ -30,7 +30,9 @@ import io
 import json
 import math
 import os
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -54,6 +56,9 @@ MODEL_ID = "openai/privacy-filter"
 # Group sub-word tokens into whole-word entity spans
 AGGREGATION = "first"
 AGG_ENUM = AggregationStrategy(AGGREGATION)
+# aggregate_first() is a hand-vectorised replica of TokenClassificationPipeline
+# .postprocess for exactly this strategy; guard against a silent strategy change.
+assert AGGREGATION == "first", "aggregate_first only implements AGGREGATION='first'"
 
 # Attention kernel. flex is th eonly performant linear space complexity option on rocm
 # if flex_attention does not load, the rank raises and the job fails loudly
@@ -69,24 +74,33 @@ MODEL_MAX_TOKENS = 128_000
 VRAM_CEILING_GB = 50.0
 VRAM_TARGET_FRACTION = 0.95
 
-# candidate documents to buffer before length-sorting + batching. goes to cpu RAM
-BUFFER_DOCS = 4096
+# this is the tok() buckets granularity at which tokenised batches reach the GPU queue
+BUFFER_DOCS = 1024
 
 # cap on sequences per forward pass to bound per-sequence overhead for batches of tiny docs
 MAX_BATCH_SEQS = 512
 
-# flex attention runs under torch.compile, which compiles a fresh kernel per
-# distinct (batch_size, seq_len). To stop the wildly varying document lengths from
-# triggering a recompile storm by bucketing geometrically.
-# MIN_SEQ_BUCKET is the smallest pad length then the ladder climbs by SEQ_BUCKET_FACTOR
-# up to the calibrated safe-single length.
+# This CPU Python thread holds the GIL like dear Life
+N_POSTPROCESS_WORKERS = 1 # NO. STOP. DO NOT INCREMENT. POISON.
+GPU_QUEUE_DEPTH = 4
+POST_QUEUE_DEPTH = 8     # forwarded logits (on host) waiting for postprocess
+WRITE_QUEUE_DEPTH = 64   # text blocks waiting to be written
+
+# queue sentinels: _DONE = clean end-of-stream, _ABORT = a stage failed, unwind
+_DONE = object()
+_ABORT = object()
+
+# flex attention runs under torch.compile, which compiles a fresh kernel per distinct
+# (batch_size, seq_len) at launch, then nothing ever again.
+# MIN_SEQ_BUCKET is the smallest pad length then the ladder climbs by
+# SEQ_BUCKET_FACTOR up to the calibrated safe-single length.
 MIN_SEQ_BUCKET = 256
 SEQ_BUCKET_FACTOR = 2
 
 # torch.compile's per-callable shape cache defaults to 8 entries
 # with more buckets than that, dynamo stops compiling new shapes and drops
 # to qudratic eager attention (BAD!)
-import torch._dynamo  # noqa: E402
+import torch._dynamo
 torch._dynamo.config.cache_size_limit = 64
 torch._dynamo.config.accumulated_cache_size_limit = 256
 
@@ -135,10 +149,7 @@ def file_size(path: Path) -> int:
 def discover_files(root: Path) -> list[Path]:
 
     files: list[Path] = []
-    # Match both the .zst and .zstd spellings of the zstd extension. pathlib
-    # anchors the glob to the end of the name, so "*.jsonl.zst" does NOT match a
-    # "*.jsonl.zstd" file -- the two patterns are disjoint, no dedup needed.
-    for pattern in ("*.jsonl.zst", "*.jsonl.zstd"):
+    for pattern in ("*.jsonl.zst", "*.jsonl.zstd", "*.jsonl.gz"):
         for p in root.rglob(pattern):
             try:
                 if p.is_file():
@@ -201,6 +212,36 @@ def shard_for_rank(entries: list[tuple[Path, int]], rank: int, world_size: int) 
     return sorted(buckets[rank])
 
 
+def extract_doc_id(row: dict) -> str:
+    """
+    Pull the document id from a row.
+
+    Files differ in where the id lives; it is always exactly one of these.
+    Probe them in order and use the first that is present:
+      1. top-level "id"
+      2. "metadata" -> "WARC-Record-ID"  (nested one level)
+      3. top-level "warc_record_id"
+      4. top-level "Document ID"
+      5. top-level "uuid"
+    """
+    val = row.get("id")
+    if val is not None:
+        return str(val)
+
+    meta = row.get("metadata")
+    if isinstance(meta, dict):
+        val = meta.get("WARC-Record-ID")
+        if val is not None:
+            return str(val)
+
+    for key in ("warc_record_id", "Document ID", "uuid"):
+        val = row.get(key)
+        if val is not None:
+            return str(val)
+
+    return ""
+
+
 def iter_rows(path: Path):
     """Yield each decoded JSON object from a *.jsonl.zst file"""
     dctx = zstd.ZstdDecompressor()
@@ -251,6 +292,109 @@ def correct_span(text: str, start: int, end: int) -> tuple[int, int, str]:
     while end > start and text[end - 1].isspace():
         end -= 1
     return start, end, text[start:end]
+
+
+def build_label_meta(clf) -> tuple:
+    """
+    Precompute the per-label lookup tables aggregate_first needs, once per process
+
+    Returns (name, group_tag, is_B, unk_id) where, indexed by label id,
+      name[i]      = id2label[i].split("-", 1)[-1]   -> the entity_group emitted
+      group_tag[i] = label without a leading B-/I- (else the whole label) for grouping
+      is_B[i]      = label starts with "B-". NB: plain (no prefix) labels get bi="I"
+                     in get_tag -> NOT B -> consecutive same-label words MERGE
+    match transformers get_tag()/group_sub_entities in token_classification.py
+    """
+    raw = clf.model.config.id2label
+    n = clf.model.config.num_labels
+    labels = [raw[i] if i in raw else raw[str(i)] for i in range(n)]
+    return (
+        np.array([l.split("-", 1)[-1] for l in labels], dtype=object),
+        np.array([l[2:] if l[:2] in ("B-", "I-") else l for l in labels], dtype=object),
+        np.array([l.startswith("B-") for l in labels], dtype=bool),
+        clf.tokenizer.unk_token_id,
+    )
+
+
+def aggregate_first(logits_np, input_ids, offsets, special_mask, sentence, meta):
+    """
+    Vectorised equivalent of ``TokenClassificationPipeline.postprocess`` for
+    ``aggregation_strategy="first"`` with the default ``ignore_labels=["O"]`` and
+    the fallback (non-word-aware) ``is_subword`` heuristic: the path this model
+    takes (that "Tokenizer does not support real words" bla-bla nonsense)
+
+    only ``(entity_group, start, end)`` are produced. entities_to_rows needs
+    nothing else: the per-token softmax, word strings and mean scores HF
+    computes are all skipped
+
+    ``logits_np`` is the (li, C) fp32 slice for one document.
+    """
+    name_arr, gtag_arr, isB_arr, unk_id = meta
+
+    special = np.asarray(special_mask, dtype=bool)
+    keep = ~special
+    if not keep.any():
+        return []
+    idx = np.nonzero(keep)[0]   # non-special token positions
+
+    pred_k = logits_np.argmax(-1)[idx]  # per-token label id (first token wins later)
+    offs = np.asarray(offsets)
+    starts = offs[idx, 0].astype(np.int64)
+    ends = offs[idx, 1].astype(np.int64)
+    ids_k = np.asarray(input_ids)[idx]
+
+    # is_subword fallback: start>0 AND neither sentence[start-1] nor sentence[start]
+    # is a ' ' (== '" " not in sentence[start-1:start+1]')
+    # only the ASCII space counts, matching HF exactly
+    if sentence:
+        cps = np.frombuffer(sentence.encode("utf-32-le"), dtype=np.uint32)
+    else:
+        cps = np.empty(0, dtype=np.uint32)
+    n = cps.shape[0]
+    is_space = cps == 0x20
+    prev_sp = np.zeros(starts.shape, dtype=bool)
+    cur_sp = np.zeros(starts.shape, dtype=bool)
+    sm1 = starts - 1
+    m = (sm1 >= 0) & (sm1 < n)
+    prev_sp[m] = is_space[sm1[m]]
+    m2 = (starts >= 0) & (starts < n)
+    cur_sp[m2] = is_space[starts[m2]]
+    is_subword = (starts > 0) & ~(prev_sp | cur_sp)
+    if unk_id is not None:  # HF forces is_subword False on <unk>
+        is_subword &= ids_k != unk_id
+
+    # words: a new word starts at the first kept token and at every non-subword token
+    # the word's label is its FIRST token's. its span is first.start..last.end.
+    K = idx.shape[0]
+    word_start = ~is_subword
+    word_start[0] = True
+    w = np.nonzero(word_start)[0]
+    word_pred = pred_k[w]
+    word_start_off = starts[w]
+    word_last = np.empty_like(w)
+    word_last[:-1] = w[1:] - 1
+    word_last[-1] = K - 1
+    word_end_off = ends[word_last]
+
+    # Entity groups: a new group starts when the tag changes or the word's bi is "B"
+    # HF does: continue only if tag == last_tag and bi != "B"
+    W = w.shape[0]
+    isB = isB_arr[word_pred]
+    new_group = np.ones(W, dtype=bool)
+    if W > 1:
+        gtag = gtag_arr[word_pred]
+        new_group[1:] = (gtag[1:] != gtag[:-1]) | isB[1:]
+    g = np.nonzero(new_group)[0]
+    g_name = name_arr[word_pred[g]]
+    g_start = word_start_off[g]
+    g_last = np.empty_like(g)
+    g_last[:-1] = g[1:] - 1
+    g_last[-1] = W - 1
+    g_end = word_end_off[g_last]
+
+    sel = g_name != "O"                              # ignore_labels == ["O"]
+    return [{"entity_group": nm, "start": int(s), "end": int(e)}
+            for nm, s, e in zip(g_name[sel], g_start[sel], g_end[sel])]
 
 
 def out_path_for(in_path: Path) -> Path:
@@ -360,10 +504,8 @@ def calibrate_vram(model, device, rank: int, ceiling_bytes: float, target_bytes:
 
 def build_seq_buckets(safe_single: int) -> list[int]:
     """
-    Fixed geometric ladder of padded sequence lengths, top rung == ``safe_single``
-    (the truncation cap). Every document is padded UP to its bucket, so the model
-    only ever sees these few lengths and flex_attention's compiled kernel is reused
-    rather than recompiled per distinct length.
+    Fixed geometric ladder of padded sequence lengths up to ``safe_single``
+    bucket construsction for flex_attention's compiled kernels recycling
     """
     buckets: list[int] = []
     L = MIN_SEQ_BUCKET
@@ -375,8 +517,7 @@ def build_seq_buckets(safe_single: int) -> list[int]:
 
 
 def bucket_for(length: int, buckets: list[int]) -> int:
-    """Index of the smallest bucket >= ``length``. Documents are truncated to the
-    top bucket, so the loop always finds one."""
+    """Index of the smallest bucket >= length"""
     for bi, L in enumerate(buckets):
         if length <= L:
             return bi
@@ -387,13 +528,9 @@ def warmup_buckets(clf, predict, target_bytes, safe_single, rank):
     """
     Pick one fixed batch size per sequence bucket from the memory fit, then run a
     dummy forward at each (batch_size, seq_len) shape so flex_attention compiles
-    every shape ONCE, up front -- the steady state then has zero recompiles.
+    every shape once, up front. the steady state then has zero recompiles.
 
-    The dummy forward doubles as an OOM safety check: if a bucket's chosen batch
-    size does not actually fit, it is halved until it does, so no real batch can
-    OOM later (and OOM-driven reshaping, which would recompile, never happens).
-
-    Returns ``(buckets, batch_sizes)``.
+    Returns ``(buckets, batch_sizes)``
     """
     buckets = build_seq_buckets(safe_single)
     pad_id = clf.tokenizer.pad_token_id if clf.tokenizer.pad_token_id is not None else 0
@@ -437,11 +574,18 @@ def warmup_buckets(clf, predict, target_bytes, safe_single, rank):
 
 def process_file(in_path: Path, clf, buckets, batch_sizes, safe_single, rank: int):
     """
-    Run inference over one input file and write output.
+    four-stage pipeline of threads joined by bounded queues
 
-    Documents are streamed, tokenised in read-sized chunks, and routed into a
-    per-bucket pending queue. A bucket is flushed as a full fixed-shape batch as
-    soon as it fills.
+    [T] producer (1 thread): iter_rows -> tokenise in BUFFER_DOCS chunks ->
+        route into per-bucket pending lists -> assemble fixed-shape (B,L) CPU
+        tensor batches (dummy-padded) -> gpu_q
+    [G] GPU forward (THIS/main thread, the only thread touching the device):
+        gpu_q -> H2D + model forward + logits->host(fp32) -> post_q
+    [P] postprocess pool (N_POSTPROCESS_WORKERS threads): post_q -> per-doc
+        clf.postprocess numpy-softmax -> entity rows as one text block -> write_q
+    [W] writer (1 thread): write_q -> zstd stream. Output row order is the batch
+        completion order
+
     """
     final_out = out_path_for(in_path)
     if final_out.exists():
@@ -454,113 +598,297 @@ def process_file(in_path: Path, clf, buckets, batch_sizes, safe_single, rank: in
     tok = clf.tokenizer
     device = clf.device
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
+    label_meta = build_label_meta(clf)   # per-label lookup tables for aggregate_first
 
     on_gpu = torch.cuda.is_available()
     if on_gpu:
         torch.cuda.reset_peak_memory_stats(device)
 
     cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
-    n_rows = n_entities = n_trunc = 0
     t0 = time.time()
 
-    with tmp_out.open("wb") as raw, cctx.stream_writer(raw) as writer:
-        out = io.TextIOWrapper(writer, encoding="utf-8")
-        pending: list[list[dict]] = [[] for _ in buckets]
+    gpu_q: queue.Queue = queue.Queue(maxsize=GPU_QUEUE_DEPTH)
+    post_q: queue.Queue = queue.Queue(maxsize=POST_QUEUE_DEPTH)
+    write_q: queue.Queue = queue.Queue(maxsize=WRITE_QUEUE_DEPTH)
 
-        def emit(doc_id, text, ents):
-            nonlocal n_entities
-            for r in entities_to_rows(doc_id, text, ents):
-                out.write(json.dumps(r, ensure_ascii=False))
-                out.write("\n")
-                n_entities += 1
+    abort = threading.Event()
+    errors: list[tuple[str, BaseException]] = []
+    # n_rows/n_trunc are touched only by the producer thread. n_entities only by the writer thread
+    # each is single-writer: no locking is needed
+    stats = {"n_rows": 0, "n_trunc": 0, "n_entities": 0}
 
-        def flush_chunk(bi: int, chunk: list[dict]):
-            # chunk holds <= batch_sizes[bi] real docs. the batch dim is padded out
-            # to the fixed size with masked dummy rows to keep the shape constant.
-            L = buckets[bi]
-            B = batch_sizes[bi]
-            k = len(chunk)
-            ids_t = torch.full((B, L), pad_id, dtype=torch.long)
-            mask_t = torch.zeros((B, L), dtype=torch.long)
-            for j, it in enumerate(chunk):
-                li = it["len"]
-                ids_t[j, :li] = torch.as_tensor(it["ids"], dtype=torch.long)
-                mask_t[j, :li] = 1
-            for j in range(k, B):       # dummy rows: one live token avoids empty softmax
-                mask_t[j, 0] = 1
-            with torch.no_grad():
-                logits = clf.model(input_ids=ids_t.to(device),
-                                   attention_mask=mask_t.to(device)).logits
-            # fp32 on host: postprocess runs a numpy softmax, which cannot take bf16
-            logits = logits.to(dtype=torch.float32, device="cpu")
-            for j, it in enumerate(chunk):
-                li = it["len"]
-                model_outputs = {
-                    "logits": logits[j:j + 1, :li, :],
-                    "input_ids": torch.as_tensor([it["ids"]], dtype=torch.long),
-                    "offset_mapping": torch.as_tensor([it["offs"]], dtype=torch.long),
-                    "special_tokens_mask": torch.as_tensor([it["stm"]], dtype=torch.long),
-                    "sentence": it["text"],
-                }
-                ents = clf.postprocess([model_outputs], aggregation_strategy=AGG_ENUM)
-                emit(it["doc_id"], it["text"], ents)
-            del ids_t, mask_t, logits
+    # Each thread accumulates wall-seconds in a LOCAL dict and merges it once,
+    # on exit, so the hot path stays lock-free. Postprocess keys are summed
+    # across all workers
+    #   gpu_wait_in  high -> producer/tokenise starves the GPU
+    #   gpu_wait_out high -> postprocess too slow, GPU blocked on backpressure
+    #   gpu_fwd      high -> genuine GPU compute (or launch starvation inflating it)
+    timers: dict[str, float] = {}
+    timers_lock = threading.Lock()
+    pc = time.perf_counter
 
-        def add(doc_id, text, ids, offs, stm):
-            bi = bucket_for(len(ids), buckets)
-            pending[bi].append({"doc_id": doc_id, "text": text, "ids": ids,
-                                "offs": offs, "stm": stm, "len": len(ids)})
-            B = batch_sizes[bi]
-            if len(pending[bi]) >= B:
-                flush_chunk(bi, pending[bi][:B])
-                del pending[bi][:B]
+    def add_times(d: dict):
+        with timers_lock:
+            for k, v in d.items():
+                timers[k] = timers.get(k, 0.0) + v
 
-        read_buf: list[tuple[str, str]] = []
+    def fail(stage: str, exc: BaseException):
+        errors.append((stage, exc))
+        abort.set()
 
-        def tokenise_and_route():
-            nonlocal n_trunc
-            if not read_buf:
-                return
-            texts = [t for _, t in read_buf]
-            enc = tok(texts, add_special_tokens=True, return_offsets_mapping=True,
-                      return_special_tokens_mask=True, truncation=False)
-            for i, (doc_id, text) in enumerate(read_buf):
-                ids = enc["input_ids"][i]
-                offs = enc["offset_mapping"][i]
-                stm = enc["special_tokens_mask"][i]
-                if len(ids) > safe_single:
-                    re = tok(text, add_special_tokens=True, return_offsets_mapping=True,
-                             return_special_tokens_mask=True, truncation=True,
-                             max_length=safe_single)
-                    ids, offs, stm = re["input_ids"], re["offset_mapping"], re["special_tokens_mask"]
-                    n_trunc += 1
-                add(doc_id, text, ids, offs, stm)
-            read_buf.clear()
-
-        for row in iter_rows(in_path):
-            n_rows += 1
-            if not should_process(row):
+    def q_put(q: queue.Queue, item) -> bool:
+        # abort-aware put: a dead downstream must not deadlock an upstream on a full queue
+        # returns False once abort is set so the caller can unwind
+        while not abort.is_set():
+            try:
+                q.put(item, timeout=0.25)
+                return True
+            except queue.Full:
                 continue
-            text = row.get("text")
-            if not text or not isinstance(text, str):
+        return False
+
+    def q_get(q: queue.Queue):
+        # abort-aware get: returns _ABORT once abort is set so loops can exit
+        while not abort.is_set():
+            try:
+                return q.get(timeout=0.25)
+            except queue.Empty:
                 continue
-            read_buf.append((str(row.get("id", "")), text))
-            if len(read_buf) >= BUFFER_DOCS:
-                tokenise_and_route()
-        tokenise_and_route()
-        for bi in range(len(buckets)):      # EOF: flush every bucket's remainder
-            if pending[bi]:
-                flush_chunk(bi, pending[bi])
-                pending[bi] = []
+        return _ABORT
+
+    # [T]
+    def producer():
+        tm = {"prod_read": 0.0, "prod_tok": 0.0, "prod_makejob": 0.0,
+              "prod_gpuq_put_wait": 0.0, "prod_jobs": 0.0}
+        try:
+            pending: list[list[dict]] = [[] for _ in buckets]
+
+            def make_job(bi: int, chunk: list[dict]):
+                # the batch dim is padded to the fixed size with masked dummy rows
+                L = buckets[bi]
+                B = batch_sizes[bi]
+                ids_t = torch.full((B, L), pad_id, dtype=torch.long)
+                mask_t = torch.zeros((B, L), dtype=torch.long)
+                for j, it in enumerate(chunk):
+                    li = it["len"]
+                    ids_t[j, :li] = torch.as_tensor(it["ids"], dtype=torch.long)
+                    mask_t[j, :li] = 1
+                for j in range(len(chunk), B):  # dummy rows: 1 token avoids empty softmax
+                    mask_t[j, 0] = 1
+                return (ids_t, mask_t, chunk)
+
+            def flush_job(bi: int, chunk: list[dict]):
+                s = pc()
+                job = make_job(bi, chunk)
+                tm["prod_makejob"] += pc() - s
+                s = pc()
+                ok = q_put(gpu_q, job)
+                tm["prod_gpuq_put_wait"] += pc() - s
+                tm["prod_jobs"] += 1
+                return ok
+
+            def route(doc_id, text, ids, offs, stm):
+                bi = bucket_for(len(ids), buckets)
+                pending[bi].append({"doc_id": doc_id, "text": text, "ids": ids,
+                                    "offs": offs, "stm": stm, "len": len(ids)})
+                if len(pending[bi]) >= batch_sizes[bi]:
+                    B = batch_sizes[bi]
+                    flush_job(bi, pending[bi][:B])
+                    del pending[bi][:B]
+
+            read_buf: list[tuple[str, str]] = []
+
+            def tokenise_and_route():
+                if not read_buf:
+                    return
+                texts = [txt for _, txt in read_buf]
+                s = pc()
+                enc = tok(texts, add_special_tokens=True, return_offsets_mapping=True,
+                          return_special_tokens_mask=True, truncation=False)
+                tm["prod_tok"] += pc() - s
+                for i, (doc_id, text) in enumerate(read_buf):
+                    ids = enc["input_ids"][i]
+                    offs = enc["offset_mapping"][i]
+                    stm = enc["special_tokens_mask"][i]
+                    if len(ids) > safe_single:
+                        s = pc()
+                        re = tok(text, add_special_tokens=True, return_offsets_mapping=True,
+                                 return_special_tokens_mask=True, truncation=True,
+                                 max_length=safe_single)
+                        tm["prod_tok"] += pc() - s
+                        ids, offs, stm = re["input_ids"], re["offset_mapping"], re["special_tokens_mask"]
+                        stats["n_trunc"] += 1
+                    route(doc_id, text, ids, offs, stm)
+                read_buf.clear()
+
+            rows = iter_rows(in_path)
+            while True:
+                if abort.is_set():
+                    return
+                s = pc()
+                try:
+                    row = next(rows)
+                except StopIteration:
+                    break
+                tm["prod_read"] += pc() - s
+                stats["n_rows"] += 1
+                if not should_process(row):
+                    continue
+                text = row.get("text")
+                if not text or not isinstance(text, str):
+                    continue
+                read_buf.append((extract_doc_id(row), text))
+                if len(read_buf) >= BUFFER_DOCS:
+                    tokenise_and_route()
+            tokenise_and_route()
+            for bi in range(len(buckets)):  # EOF: flush every bucket's remainder
+                if pending[bi]:
+                    flush_job(bi, pending[bi])
+                    pending[bi] = []
+        except Exception as exc:
+            fail("tokenize", exc)
+        finally:
+            add_times(tm)
+            if not abort.is_set():
+                gpu_q.put(_DONE)    # single sentinel ends the GPU stage
+
+    # [P]
+    def postprocessor():
+        # summed across all N_POSTPROCESS_WORKERS workers
+        tm = {"post_q_get_wait": 0.0, "post_proc": 0.0, "post_writeq_put_wait": 0.0}
+        try:
+            while True:
+                s = pc()
+                item = q_get(post_q)
+                tm["post_q_get_wait"] += pc() - s
+                if item is _ABORT or item is _DONE:
+                    return
+                logits, chunk = item
+                s = pc()
+                parts: list[str] = []
+                cnt = 0
+                logits_np = logits.numpy()   # (B, L, C) fp32, zero-copy view of the host tensor
+                for j, it in enumerate(chunk):
+                    li = it["len"]
+                    ents = aggregate_first(logits_np[j, :li], it["ids"], it["offs"],
+                                           it["stm"], it["text"], label_meta)
+                    for r in entities_to_rows(it["doc_id"], it["text"], ents):
+                        parts.append(json.dumps(r, ensure_ascii=False))
+                        cnt += 1
+                tm["post_proc"] += pc() - s
+                if parts:
+                    s = pc()
+                    ok = q_put(write_q, ("\n".join(parts) + "\n", cnt))
+                    tm["post_writeq_put_wait"] += pc() - s
+                    if not ok:
+                        return
+        except Exception as exc:
+            fail("postprocess", exc)
+        finally:
+            add_times(tm)
+
+    # [W]
+    def make_writer(out):
+        def writer():
+            tm = {"write_q_get_wait": 0.0, "write_io": 0.0}
+            try:
+                while True:
+                    s = pc()
+                    item = q_get(write_q)
+                    tm["write_q_get_wait"] += pc() - s
+                    if item is _ABORT or item is _DONE:
+                        return
+                    block, cnt = item
+                    s = pc()
+                    out.write(block)
+                    tm["write_io"] += pc() - s
+                    stats["n_entities"] += cnt
+            except Exception as exc:
+                fail("write", exc)
+            finally:
+                add_times(tm)
+        return writer
+
+    with tmp_out.open("wb") as raw, cctx.stream_writer(raw) as cwriter:
+        out = io.TextIOWrapper(cwriter, encoding="utf-8")
+
+        prod_t = threading.Thread(target=producer, name="tok", daemon=True)
+        post_ts = [threading.Thread(target=postprocessor, name=f"post{i}", daemon=True)
+                   for i in range(N_POSTPROCESS_WORKERS)]
+        write_t = threading.Thread(target=make_writer(out), name="write", daemon=True)
+        prod_t.start()
+        for t in post_ts:
+            t.start()
+        write_t.start()
+
+        # [G] GPU forward stage runs on THIS (main) thread: the device was set in
+        # main() here, and keeping a single GPU thread bounds VRAM to one forward(!)
+        g_wait_in = g_fwd = g_wait_out = 0.0
+        n_fwd = 0
+        while True:
+            s = pc()
+            item = q_get(gpu_q)
+            g_wait_in += pc() - s
+            if item is _ABORT or item is _DONE:
+                break
+            ids_t, mask_t, chunk = item
+            try:
+                s = pc()
+                with torch.no_grad():
+                    logits = clf.model(input_ids=ids_t.to(device),
+                                       attention_mask=mask_t.to(device)).logits
+                # fp32 on host: postprocess runs a numpy softmax, which cannot take bf16.
+                # .to("cpu") synchronises, so g_fwd is the GPU stage's true wall time.
+                logits = logits.to(dtype=torch.float32, device="cpu")
+                g_fwd += pc() - s
+                n_fwd += 1
+            except Exception as exc:
+                fail("forward", exc)
+                break
+            s = pc()
+            ok = q_put(post_q, (logits, chunk))
+            g_wait_out += pc() - s
+            if not ok:
+                break
+        add_times({"gpu_wait_in": g_wait_in, "gpu_fwd": g_fwd,
+                   "gpu_wait_out": g_wait_out, "gpu_forwards": float(n_fwd)})
+
+        # clean shutdown: one _DONE per postprocess worker, then one for the writer
+        # on abort these are skipped; every thread exits via its abort-aware get
+        if not abort.is_set():
+            for _ in post_ts:
+                q_put(post_q, _DONE)
+        for t in post_ts:
+            t.join()
+        if not abort.is_set():
+            q_put(write_q, _DONE)
+        write_t.join()
+        prod_t.join()
+
+        if errors:
+            stage, exc = errors[0]
+            raise RuntimeError(f"pipeline stage {stage!r} failed on {in_path.name}: {exc!r}") from exc
+
         out.flush()
 
     os.replace(tmp_out, final_out)
     dt = time.time() - t0
     peak = torch.cuda.max_memory_allocated(device) / 2**30 if on_gpu else 0.0
+    n_trunc = stats["n_trunc"]
     extra = f", {n_trunc} truncated@{safe_single}tok" if n_trunc else ""
     log(rank,
-        f"done {in_path.name}: {n_rows} rows -> {n_entities} entities "
+        f"done {in_path.name}: {stats['n_rows']} rows -> {stats['n_entities']} entities "
         f"in {dt:.1f}s (peak {peak:.1f}GB{extra})")
+    # GPU keys are this-thread wall time. prod_* is the single producer thread
+    # post_* is SUMMED across N_POSTPROCESS_WORKERS
+    log(rank, f"timers {in_path.name}: "
+        + " ".join(f"{k}={timers.get(k, 0.0):.1f}"
+                   for k in ("gpu_wait_in", "gpu_fwd", "gpu_wait_out",
+                             "prod_read", "prod_tok", "prod_makejob", "prod_gpuq_put_wait",
+                             "post_q_get_wait", "post_proc", "post_writeq_put_wait",
+                             "write_q_get_wait", "write_io"))
+        + f" gpu_forwards={int(timers.get('gpu_forwards', 0))}"
+        + f" jobs={int(timers.get('prod_jobs', 0))}")
     if peak > VRAM_CEILING_GB:
         log(rank, f"WARNING: peak {peak:.1f}GB exceeded the {VRAM_CEILING_GB}GB ceiling")
 
@@ -576,7 +904,7 @@ def main():
         torch.cuda.set_device(local_rank)
         device = local_rank
 
-    # Pin this rank to the CPU cores in the same NUMA domain as its GCD,
+    # pin this rank to the CPU cores in the same NUMA domain as its GCD:
     # so tokenisation + zstd threads don't pay cross-NUMA memory-bandwidth taxes
     bound_cores = None
     if hasattr(os, "sched_setaffinity") and local_world == 8 and local_rank in LUMI_GCD_CPU_CORES:

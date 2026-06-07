@@ -1,11 +1,11 @@
 ## PII detection on LUMI
 
-Massively parallel inference with the `openai/privacy-filter` PII-detection model over a large tree of `*.jsonl.zst(d)` files, designed to run across multiple full LUMI-G nodes inside a Singularity container, launched with `torchrun`.
+Massively parallel inference with the `openai/privacy-filter` PII-detection model over a large tree of `*.jsonl.zst(d)/.gz` files or symlinks, designed to run across multiple full LUMI-G nodes inside a Singularity container, launched with `torchrun`.
 
 
 ### 1. What is this?
 
-* Reads every `*.jsonl.zst(d)` file/symlink found anywhere under an input root folder.
+* Reads every `*.jsonl.zst(d)/.gz` file/symlink found anywhere under an input root folder.
 * For each line (a JSON object), it looks at the `text` field and runs the model to find PII entities.
 * A line is skipped only if its `propella-4b.pii_presence` value is `"no_pii"`.
   If the `propella-4b` key is missing, the line is processed.
@@ -37,7 +37,7 @@ The model's labels used for `name` identifying `value` entity types are: `accoun
 
 ### 3. Nice things
 
-Resume: each output file is written to a `.tmp` file and atomically renamed only on success. If a job hits the time limit and you resubmit, files that already exist are skipped, so you resume roughly where you left off. You loose the files being processed as .tmp when the job expired and the .tmp remain on disk.
+Resume: each output file is written to a `.tmp` and renamed only when completed. Resubmitting skips already-finished files. `.tmp` files from the expired job are left on disk and can be safely deleted.
 
 
 ### 4. One-time setup on LUMI  
@@ -108,13 +108,14 @@ In `pii_infer.py`
 
 * `VRAM_CEILING_GB` (default `50.0`) The GCD has 64 GB
 * `VRAM_TARGET_FRACTION` (default `0.95`) — plan batches/lengths against this fraction of the ceiling
-* `DTYPE` (default `torch.bfloat16`) — model compute dtype
-* `BUFFER_DOCS` (default `4096`) — how many documents are buffered before length-sorting and batching. Larger = less padding waste, more host RAM
+* `BUFFER_DOCS` (default `1024`) — how many documents the tokenizer thread encodes per batch before routing into buckets. Smaller feeds the GPU more steadily, larger amortises tokenizer call overhead.
 * `MAX_BATCH_SEQS` (default `512`) — hard cap on sequences per forward, on top of the token budget
-* `AGGREGATION` — how sub-word tokens are merged into entity spans. `"first"` by default
 
 The startup VRAM calibration sizes batches and the `safe_single` length cap automatically from measured memory.
 There is no `MAX_LENGTH`/`STRIDE` — this model is fed whole documents. If `WARNING: peak ... exceeded the ... ceiling` shows in the logs, lower `VRAM_TARGET_FRACTION`
+
+> [!NOTE]
+> There is no immediate need to tune anything, significant effort has been put to achieve a safe and optimum all-rounder hyperparameters setting
 
 
 ## 7. Troubleshooting
@@ -122,5 +123,5 @@ There is no `MAX_LENGTH`/`STRIDE` — this model is fed whole documents. If `WAR
 * `squeue` shows nothing / job ended instantly — check `logs/pii-<jobid>.err`. The most common causes are a wrong `--account` or paths that don't exist.
 * `OSError: ... openai/privacy-filter` / "Can't load" — the model wasn't baked into the `.sqsh`. Re-run `venv_and_squash.sh` on a login node (it needs internet) and confirm it printed the transformers version and "model cached".
 * CUDA/HIP out of memory — lower `VRAM_TARGET_FRACTION`
-* Job hit the time limit — just `sbatch run_it.sh` again. finished files are skipped and it resumes. Voila.
+* Job hit the time limit — just `sbatch run_it.sh` again. finished files are skipped and expected missing files in the output path are started. Voila.
 
