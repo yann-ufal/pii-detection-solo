@@ -118,7 +118,7 @@ There is no `MAX_LENGTH`/`STRIDE` — this model is fed whole documents. If `WAR
 > There is no immediate need to tune anything, significant effort has been put to achieve a safe and optimum all-rounder hyperparameters setting
 
 
-## 7. Troubleshooting
+### 7. Troubleshooting
 
 * `squeue` shows nothing / job ended instantly — check `logs/pii-<jobid>.err`. The most common causes are a wrong `--account` or paths that don't exist.
 * `OSError: ... openai/privacy-filter` / "Can't load" — the model wasn't baked into the `.sqsh`. Re-run `venv_and_squash.sh` on a login node (it needs internet) and confirm it printed the transformers version and "model cached".
