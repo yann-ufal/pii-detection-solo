@@ -40,7 +40,6 @@ import numpy as np
 import torch
 import zstandard as zstd
 from transformers import pipeline
-from transformers.pipelines.token_classification import AggregationStrategy
 
 
 # Root of the input folder tree. symlinks or files.
@@ -55,9 +54,6 @@ MODEL_ID = "openai/privacy-filter"
 
 # Group sub-word tokens into whole-word entity spans
 AGGREGATION = "first"
-AGG_ENUM = AggregationStrategy(AGGREGATION)
-# aggregate_first() is a hand-vectorised replica of TokenClassificationPipeline
-# .postprocess for exactly this strategy; guard against a silent strategy change.
 assert AGGREGATION == "first", "aggregate_first only implements AGGREGATION='first'"
 
 # Attention kernel. flex is th eonly performant linear space complexity option on rocm
@@ -68,17 +64,17 @@ ATTN_IMPLEMENTATIONS = ("flex_attention",)
 DTYPE = torch.bfloat16
 
 # context limit of the model, also the absolute truncation cap
-MODEL_MAX_TOKENS = 128_000
+MODEL_MAX_TOKENS = 128000
 
-# VRAM safety budget per GCD. The card has 64 GB
-VRAM_CEILING_GB = 50.0
-VRAM_TARGET_FRACTION = 0.95
+# per GCD
+VRAM_CEILING_GB = 64
+VRAM_TARGET_FRACTION = 0.80
 
 # this is the tok() buckets granularity at which tokenised batches reach the GPU queue
-BUFFER_DOCS = 1024
+BUFFER_DOCS = 2048
 
 # cap on sequences per forward pass to bound per-sequence overhead for batches of tiny docs
-MAX_BATCH_SEQS = 512
+MAX_BATCH_SEQS = 2048
 
 # This CPU Python thread holds the GIL like dear Life
 N_POSTPROCESS_WORKERS = 1 # NO. STOP. DO NOT INCREMENT. POISON.
@@ -95,7 +91,7 @@ _ABORT = object()
 # MIN_SEQ_BUCKET is the smallest pad length then the ladder climbs by
 # SEQ_BUCKET_FACTOR up to the calibrated safe-single length.
 MIN_SEQ_BUCKET = 256
-SEQ_BUCKET_FACTOR = 2
+SEQ_BUCKET_FACTOR = 1.5
 
 # torch.compile's per-callable shape cache defaults to 8 entries
 # with more buckets than that, dynamo stops compiling new shapes and drops
@@ -297,24 +293,29 @@ def correct_span(text: str, start: int, end: int) -> tuple[int, int, str]:
 def build_label_meta(clf) -> tuple:
     """
     Precompute the per-label lookup tables aggregate_first needs, once per process
+    This model tags in the BIOES scheme B-/I-/E-/S- per entity type
+    HF's get_tag()/group_sub_entities only understand B-/I-
 
-    Returns (name, group_tag, is_B, unk_id) where, indexed by label id,
-      name[i]      = id2label[i].split("-", 1)[-1]   -> the entity_group emitted
-      group_tag[i] = label without a leading B-/I- (else the whole label) for grouping
-      is_B[i]      = label starts with "B-". NB: plain (no prefix) labels get bi="I"
-                     in get_tag -> NOT B -> consecutive same-label words MERGE
-    match transformers get_tag()/group_sub_entities in token_classification.py
+    Returns (name, group_tag, opens, closes, unk_id) indexed by label id
     """
     raw = clf.model.config.id2label
     n = clf.model.config.num_labels
     labels = [raw[i] if i in raw else raw[str(i)] for i in range(n)]
+
+    def strip(l):  # drop a leading B-/I-/E-/S- prefix. "O" unchanged
+        return l[2:] if l[:2] in ("B-", "I-", "E-", "S-") else l
+
     return (
-        np.array([l.split("-", 1)[-1] for l in labels], dtype=object),
-        np.array([l[2:] if l[:2] in ("B-", "I-") else l for l in labels], dtype=object),
-        np.array([l.startswith("B-") for l in labels], dtype=bool),
+        np.array([strip(l) for l in labels], dtype=object),
+        np.array([strip(l) for l in labels], dtype=object),
+        np.array([l[:2] in ("B-", "S-") for l in labels], dtype=bool),
+        np.array([l[:2] in ("E-", "S-") for l in labels], dtype=bool),
         clf.tokenizer.unk_token_id,
     )
 
+
+# all Unicode whitespace code points. every whitespace char is <= U+3000
+WHITESPACE_CPS = np.array(sorted(c for c in range(0x3001) if chr(c).isspace()), dtype=np.uint32)
 
 def aggregate_first(logits_np, input_ids, offsets, special_mask, sentence, meta):
     """
@@ -327,9 +328,11 @@ def aggregate_first(logits_np, input_ids, offsets, special_mask, sentence, meta)
     nothing else: the per-token softmax, word strings and mean scores HF
     computes are all skipped
 
+    Two modifs: word boundaries use all unicode whitespace, and grouping is BIOES-aware
+
     ``logits_np`` is the (li, C) fp32 slice for one document.
     """
-    name_arr, gtag_arr, isB_arr, unk_id = meta
+    name_arr, gtag_arr, opens_arr, closes_arr, unk_id = meta
 
     special = np.asarray(special_mask, dtype=bool)
     keep = ~special
@@ -343,15 +346,12 @@ def aggregate_first(logits_np, input_ids, offsets, special_mask, sentence, meta)
     ends = offs[idx, 1].astype(np.int64)
     ids_k = np.asarray(input_ids)[idx]
 
-    # is_subword fallback: start>0 AND neither sentence[start-1] nor sentence[start]
-    # is a ' ' (== '" " not in sentence[start-1:start+1]')
-    # only the ASCII space counts, matching HF exactly
     if sentence:
         cps = np.frombuffer(sentence.encode("utf-32-le"), dtype=np.uint32)
     else:
         cps = np.empty(0, dtype=np.uint32)
     n = cps.shape[0]
-    is_space = cps == 0x20
+    is_space = np.isin(cps, WHITESPACE_CPS)
     prev_sp = np.zeros(starts.shape, dtype=bool)
     cur_sp = np.zeros(starts.shape, dtype=bool)
     sm1 = starts - 1
@@ -376,14 +376,14 @@ def aggregate_first(logits_np, input_ids, offsets, special_mask, sentence, meta)
     word_last[-1] = K - 1
     word_end_off = ends[word_last]
 
-    # Entity groups: a new group starts when the tag changes or the word's bi is "B"
-    # HF does: continue only if tag == last_tag and bi != "B"
+    # BIOES entity groups instead of HF's BIO-only rule
     W = w.shape[0]
-    isB = isB_arr[word_pred]
+    opens = opens_arr[word_pred]
+    closes = closes_arr[word_pred]
     new_group = np.ones(W, dtype=bool)
     if W > 1:
         gtag = gtag_arr[word_pred]
-        new_group[1:] = (gtag[1:] != gtag[:-1]) | isB[1:]
+        new_group[1:] = (gtag[1:] != gtag[:-1]) | opens[1:] | closes[:-1]
     g = np.nonzero(new_group)[0]
     g_name = name_arr[word_pred[g]]
     g_start = word_start_off[g]
@@ -392,7 +392,7 @@ def aggregate_first(logits_np, input_ids, offsets, special_mask, sentence, meta)
     g_last[-1] = W - 1
     g_end = word_end_off[g_last]
 
-    sel = g_name != "O"                              # ignore_labels == ["O"]
+    sel = g_name != "O" # ignore_labels == ["O"]
     return [{"entity_group": nm, "start": int(s), "end": int(e)}
             for nm, s, e in zip(g_name[sel], g_start[sel], g_end[sel])]
 
@@ -615,14 +615,13 @@ def process_file(in_path: Path, clf, buckets, batch_sizes, safe_single, rank: in
     errors: list[tuple[str, BaseException]] = []
     # n_rows/n_trunc are touched only by the producer thread. n_entities only by the writer thread
     # each is single-writer: no locking is needed
-    stats = {"n_rows": 0, "n_trunc": 0, "n_entities": 0}
+    stats = {"n_rows": 0, "n_trunc": 0, "n_entities": 0, "n_tokens": 0}  # TEMP: n_tokens for throughput
 
     # Each thread accumulates wall-seconds in a LOCAL dict and merges it once,
     # on exit, so the hot path stays lock-free. Postprocess keys are summed
     # across all workers
     #   gpu_wait_in  high -> producer/tokenise starves the GPU
     #   gpu_wait_out high -> postprocess too slow, GPU blocked on backpressure
-    #   gpu_fwd      high -> genuine GPU compute (or launch starvation inflating it)
     timers: dict[str, float] = {}
     timers_lock = threading.Lock()
     pc = time.perf_counter
@@ -688,6 +687,7 @@ def process_file(in_path: Path, clf, buckets, batch_sizes, safe_single, rank: in
                 return ok
 
             def route(doc_id, text, ids, offs, stm):
+                stats["n_tokens"] += len(ids)  # TEMP: real (post-truncation) tokens fed to GPU
                 bi = bucket_for(len(ids), buckets)
                 pending[bi].append({"doc_id": doc_id, "text": text, "ids": ids,
                                     "offs": offs, "stm": stm, "len": len(ids)})
@@ -876,9 +876,11 @@ def process_file(in_path: Path, clf, buckets, batch_sizes, safe_single, rank: in
     peak = torch.cuda.max_memory_allocated(device) / 2**30 if on_gpu else 0.0
     n_trunc = stats["n_trunc"]
     extra = f", {n_trunc} truncated@{safe_single}tok" if n_trunc else ""
+    n_tokens = stats["n_tokens"]  # TEMP
+    tok_s = n_tokens / dt if dt > 0 else 0.0  # TEMP: per-file throughput
     log(rank,
         f"done {in_path.name}: {stats['n_rows']} rows -> {stats['n_entities']} entities "
-        f"in {dt:.1f}s (peak {peak:.1f}GB{extra})")
+        f"in {dt:.1f}s (peak {peak:.1f}GB{extra}) [{n_tokens} tokens, {tok_s:,.0f} tok/s]")
     # GPU keys are this-thread wall time. prod_* is the single producer thread
     # post_* is SUMMED across N_POSTPROCESS_WORKERS
     log(rank, f"timers {in_path.name}: "

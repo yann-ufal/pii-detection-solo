@@ -44,12 +44,11 @@ singularity exec \
         VENV_SITE=$(python -c "import sysconfig; print(sysconfig.get_path('"'"'purelib'"'"'))")
         export PYTHONPATH="$VENV_SITE${PYTHONPATH:+:$PYTHONPATH}"
         python -m pip install --upgrade pip
-        python -m pip install --upgrade "transformers>=5.6.0"
-        echo "transformers version installed (expect >=5.6.0):"
+        python -m pip install --upgrade "transformers==5.12.0"
+        echo "transformers version installed:"
         python -c "import transformers; print(transformers.__version__)"
 
-        # pre-download the model weights now (login node has internet) into a cache that lives inside /user-software
-        # gets baked into the .sqsh and is available offline at run time. run_it.sh sets HF_HOME=/user-software/hf
+        # pre-download the model weights now. run_it.sh sets HF_HOME=/user-software/hf
         export HF_HOME=/user-software/hf
         python -c "
 from transformers import AutoModelForTokenClassification, AutoTokenizer

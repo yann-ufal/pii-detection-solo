@@ -1,6 +1,7 @@
 __pycache__/
 .venv
+uv.lock
 
 attention_probe.py
 diagnose_attention.sh
-verify_postprocess.py
+write_50sorted.sh
